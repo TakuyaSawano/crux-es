@@ -32,7 +32,4 @@ pub trait Repository {
         id: Self::Id,
         command: &<Self::Aggregate as Aggregate>::Command,
     ) -> Result<Self::CommandResponse, Self::Error>;
-
-    /// Commit the changes made by the handled command.
-    fn commit(&mut self) -> Result<(), Self::Error>;
 }
