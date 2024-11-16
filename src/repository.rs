@@ -24,7 +24,7 @@ pub trait Repository {
     /// Create a new Aggregate from Data.
     fn create(&mut self, data: Self::Data) -> Result<Self::Id, Self::Error>;
 
-    fn find(&mut self, id: Self::Id) -> Result<Self::Aggregate, Self::Error>;
+    fn find(&mut self, id: Self::Id) -> Result<Option<Self::Aggregate>, Self::Error>;
 
     /// Handle a command for an existing Aggregate.
     fn handle_command(
