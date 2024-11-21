@@ -1,24 +1,41 @@
-use std::fmt::Debug;
+#[cfg(test)]
+mod tests;
 
-use crate::collection::CollectionEvent;
+use std::error::Error;
 
-/// Types which persist and load events for set of Aggregates.
-pub trait EventStore<E: CollectionEvent> {
-    /// Error type of handling EventStore.
-    type Error: Debug;
+/// Types which have transaction management capabilities.
+pub trait TransactionManager {
+    /// Associated Type representing the error type.
+    type Error: Error;
 
-    /// Save the events.
-    /// Arrange to call EventBroker::publish() when saving the events.
-    fn save(&mut self, events: Vec<E>) -> Result<(), Self::Error>;
+    /// Begin a transaction.
+    fn begin(&mut self) -> Result<(), Self::Error>;
 
-    /// Load the events.
-    fn load(&self, id: E::AggregateId) -> Result<Vec<E>, Self::Error>;
+    /// Commit the transaction.
+    fn commit(&mut self) -> Result<(), Self::Error>;
+
+    /// Rollback the transaction.
+    fn rollback(&mut self) -> Result<(), Self::Error>;
 }
 
-pub trait TransactionManager {
-    type Error: Debug;
+/// Types which represent an event store.
+pub trait EventStore {
+    /// Associated Type representing the query to persist event.
+    type Persistable;
+    /// Associated Type representing the error type.
+    type Error: Error;
 
-    fn begin(&mut self) -> Result<(), Self::Error>;
-    fn commit(&mut self) -> Result<(), Self::Error>;
-    fn rollback(&mut self) -> Result<(), Self::Error>;
+    /// Save the events.
+    fn save(&mut self, events: &[Self::Persistable]) -> Result<(), Self::Error>;
+}
+
+/// Types which represent a handler for a query to the event store.
+pub trait QueryHandler<Query> {
+    /// Associated Type representing the response type.
+    type Response;
+    /// Associated Type representing the error type.
+    type Error: Error;
+
+    /// Handle the query.
+    fn handle(&self, query: Query) -> Result<Self::Response, Self::Error>;
 }
