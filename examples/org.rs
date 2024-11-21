@@ -1,600 +1,322 @@
-use crux_es::aggregate::Aggregate;
-use crux_es::collection::{Collection, CollectionEvent};
-use crux_es::event_broker::EventBroker;
-use crux_es::event_store::{EventStore, TransactionManager};
-
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct UserOrganizationId(pub String);
+use crux_es::{backlog::*, event_store::*};
 
-pub struct Organization {
-    pub name: String,
-    pub users: HashMap<UserId, UserOrganizationId>,
-    pub max_users: usize,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OrgId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UserId(String);
+
+struct Org {
+    id: OrgId,
+    name: String,
+    users: Vec<UserId>,
+    max_users: usize,
+    reserved_id: Option<UserAddId>,
 }
 
-pub enum OrganizationCommand {
-    Rename(String),
-    UserReserve(String),
-    AddUser(UserId, UserOrganizationId),
-    RemoveUser(UserId),
+struct OrgService {
+    orgs: HashMap<OrgId, Org>,
 }
 
-#[derive(Debug, Clone)]
-pub enum OrganizationEvent {
-    Renamed(String),
-    UserReserved(UserOrganizationId),
-    UserAdded(UserId, UserOrganizationId),
-    UserRemoved(UserId),
-}
-
-#[derive(Debug, Clone)]
-pub enum OrganizationError {
-    MaxUsersReached,
-    UserNotFound,
-}
-
-impl Organization {
-    pub fn new(name: String, max_users: usize) -> Self {
-        Organization {
-            name,
-            users: HashMap::new(),
-            max_users,
+impl OrgService {
+    fn reserve_user(&mut self, id: OrgId, user_add_id: UserAddId) -> Result<(), String> {
+        let org = self.orgs.get_mut(&id).ok_or("Org not found")?;
+        if org.reserved_id.is_some() {
+            return Err("User already reserved".to_string());
         }
-    }
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct OrganizationId(pub String);
-
-pub struct User {
-    pub name: String,
-    pub email: String,
-    pub organization_id: OrganizationId,
-    pub uo_id: UserOrganizationId,
-}
-
-pub enum UserCommand {
-    Rename(String),
-    ChangeEmail(String),
-}
-
-#[derive(Debug, Clone)]
-pub enum UserEvent {
-    Renamed(String),
-    EmailChanged(String),
-}
-
-#[derive(Debug, Clone)]
-pub enum UserError {}
-
-impl User {
-    pub fn new(
-        name: String,
-        email: String,
-        organization_id: OrganizationId,
-        uo_id: UserOrganizationId,
-    ) -> Self {
-        User {
-            name,
-            email,
-            organization_id,
-            uo_id,
+        if org.users.len() >= org.max_users {
+            return Err("Max users reached".to_string());
         }
-    }
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct UserId(pub usize);
-
-impl Aggregate for Organization {
-    type Command = OrganizationCommand;
-    type Event = OrganizationEvent;
-    type Error = OrganizationError;
-    fn apply_event(&mut self, event: &Self::Event) {
-        match event {
-            OrganizationEvent::Renamed(name) => {
-                self.name = name.clone();
-            }
-            OrganizationEvent::UserReserved(_uo_id) => {}
-            OrganizationEvent::UserAdded(user_id, uo_id) => {
-                self.users.insert(user_id.clone(), uo_id.clone());
-            }
-            OrganizationEvent::UserRemoved(user_id) => {
-                self.users.remove(user_id);
-            }
-        }
-    }
-    fn handle_command(&self, command: &Self::Command) -> Result<Vec<Self::Event>, Self::Error> {
-        match command {
-            OrganizationCommand::Rename(name) => Ok(vec![OrganizationEvent::Renamed(name.clone())]),
-            OrganizationCommand::UserReserve(name) => {
-                let uo_id = UserOrganizationId(format!("{}-{}", self.name, name));
-                Ok(vec![OrganizationEvent::UserReserved(uo_id)])
-            }
-            OrganizationCommand::AddUser(user_id, uo_id) => {
-                if self.users.len() >= self.max_users {
-                    return Err(OrganizationError::MaxUsersReached);
-                }
-                Ok(vec![OrganizationEvent::UserAdded(
-                    user_id.clone(),
-                    uo_id.clone(),
-                )])
-            }
-            OrganizationCommand::RemoveUser(user_id) => {
-                if !self.users.contains_key(user_id) {
-                    return Err(OrganizationError::UserNotFound);
-                }
-                Ok(vec![OrganizationEvent::UserRemoved(user_id.clone())])
-            }
-        }
-    }
-}
-
-impl Aggregate for User {
-    type Command = UserCommand;
-    type Event = UserEvent;
-    type Error = UserError;
-    fn apply_event(&mut self, event: &Self::Event) {
-        match event {
-            UserEvent::Renamed(name) => {
-                self.name = name.clone();
-            }
-            UserEvent::EmailChanged(email) => {
-                self.email = email.clone();
-            }
-        }
-    }
-    fn handle_command(&self, command: &Self::Command) -> Result<Vec<Self::Event>, Self::Error> {
-        match command {
-            UserCommand::Rename(name) => Ok(vec![UserEvent::Renamed(name.clone())]),
-            UserCommand::ChangeEmail(email) => Ok(vec![UserEvent::EmailChanged(email.clone())]),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum OrganizationCollectionEvent {
-    Created(OrganizationId, (String, usize)),
-    Aggregate(OrganizationId, OrganizationEvent),
-    Deleted(OrganizationId),
-}
-
-#[derive(Debug, Clone)]
-pub enum UserCollectionEvent {
-    Created(UserId, (String, String, OrganizationId, UserOrganizationId)),
-    Aggregate(UserId, UserEvent),
-    Deleted(UserId),
-}
-
-impl CollectionEvent for OrganizationCollectionEvent {
-    type AggregateId = OrganizationId;
-    fn aggregate_id(&self) -> Self::AggregateId {
-        match self {
-            OrganizationCollectionEvent::Created(id, _) => id.clone(),
-            OrganizationCollectionEvent::Aggregate(id, _) => id.clone(),
-            OrganizationCollectionEvent::Deleted(id) => id.clone(),
-        }
-    }
-}
-
-impl CollectionEvent for UserCollectionEvent {
-    type AggregateId = UserId;
-    fn aggregate_id(&self) -> Self::AggregateId {
-        match self {
-            UserCollectionEvent::Created(id, _) => id.clone(),
-            UserCollectionEvent::Aggregate(id, _) => id.clone(),
-            UserCollectionEvent::Deleted(id) => id.clone(),
-        }
-    }
-}
-
-pub struct OrganizationCollection {}
-pub struct UserCollection {
-    pub length: usize,
-}
-
-#[derive(Debug, Clone)]
-pub enum OrganizationCollectionError {
-    NotFound(OrganizationId),
-    Origanization(OrganizationError),
-    Store(String),
-    InvalidEvent(OrganizationCollectionEvent),
-}
-
-impl From<OrganizationError> for OrganizationCollectionError {
-    fn from(e: OrganizationError) -> Self {
-        OrganizationCollectionError::Origanization(e)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum UserCollectionError {
-    NotFound(UserId),
-    User(UserError),
-    Store(String),
-    InvalidEvent(UserCollectionEvent),
-}
-
-impl From<UserError> for UserCollectionError {
-    fn from(e: UserError) -> Self {
-        UserCollectionError::User(e)
-    }
-}
-
-impl Collection for OrganizationCollection {
-    type Aggregate = Organization;
-    type Id = OrganizationId;
-    type Event = OrganizationCollectionEvent;
-    type Response = String;
-    type Data = (String, usize);
-    type Error = OrganizationCollectionError;
-    fn create<ES: EventStore<Self::Event>>(
-        &mut self,
-        data: Self::Data,
-        store: &mut ES,
-    ) -> Result<Self::Id, Self::Error> {
-        let id = OrganizationId(data.0.clone());
-        store
-            .save(vec![OrganizationCollectionEvent::Created(id.clone(), data)])
-            .map_err(|e| OrganizationCollectionError::Store(format!("{:?}", e)))?;
-        Ok(id)
-    }
-    fn find<ES: EventStore<Self::Event>>(
-        &mut self,
-        id: Self::Id,
-        store: &mut ES,
-    ) -> Result<Option<Self::Aggregate>, Self::Error> {
-        let events = store
-            .load(id)
-            .map_err(|e| OrganizationCollectionError::Store(format!("{:?}", e)))?;
-        let mut iter = events.iter();
-        let e = iter.next();
-        let mut aggregate = match e {
-            Some(OrganizationCollectionEvent::Created(_, (name, max_users))) => {
-                Some(Organization::new(name.clone(), *max_users))
-            }
-            None => None,
-            _ => {
-                return Err(OrganizationCollectionError::InvalidEvent(
-                    e.unwrap().clone(),
-                ))
-            }
-        };
-        for event in iter {
-            match event {
-                OrganizationCollectionEvent::Aggregate(_, event) => {
-                    if let Some(aggregate) = aggregate.as_mut() {
-                        aggregate.apply_event(event);
-                    }
-                }
-                OrganizationCollectionEvent::Deleted(_) => {
-                    return Ok(None);
-                }
-                _ => {}
-            }
-        }
-        Ok(aggregate)
-    }
-    fn handle_command<ES: EventStore<Self::Event>>(
-        &mut self,
-        id: Self::Id,
-        command: &<Self::Aggregate as Aggregate>::Command,
-        store: &mut ES,
-    ) -> Result<Self::Response, Self::Error> {
-        let aggregate = self
-            .find(id.clone(), store)?
-            .ok_or_else(|| OrganizationCollectionError::NotFound(id.clone()))?;
-        let events = aggregate
-            .handle_command(command)?
-            .iter()
-            .map(|e| OrganizationCollectionEvent::Aggregate(id.clone(), e.clone()))
-            .collect();
-        store
-            .save(events)
-            .map_err(|e| OrganizationCollectionError::Store(format!("{:?}", e)))?;
-        Ok("Success".to_string())
-    }
-}
-
-impl Collection for UserCollection {
-    type Aggregate = User;
-    type Data = (String, String, OrganizationId, UserOrganizationId);
-    type Error = UserCollectionError;
-    type Event = UserCollectionEvent;
-    type Id = UserId;
-    type Response = String;
-    fn create<ES: EventStore<Self::Event>>(
-        &mut self,
-        data: Self::Data,
-        store: &mut ES,
-    ) -> Result<Self::Id, Self::Error> {
-        self.length += 1;
-        let id = UserId(self.length);
-        store
-            .save(vec![UserCollectionEvent::Created(id.clone(), data)])
-            .map_err(|e| UserCollectionError::Store(format!("{:?}", e)))?;
-        Ok(id)
-    }
-    fn find<ES: EventStore<Self::Event>>(
-        &mut self,
-        id: Self::Id,
-        store: &mut ES,
-    ) -> Result<Option<Self::Aggregate>, Self::Error> {
-        let events = store
-            .load(id)
-            .map_err(|e| UserCollectionError::Store(format!("{:?}", e)))?;
-        let mut iter = events.iter();
-        let e = iter.next();
-        let mut aggregate = match e {
-            Some(UserCollectionEvent::Created(_, (name, email, organization_id, uo_id))) => {
-                Some(User::new(
-                    name.clone(),
-                    email.clone(),
-                    organization_id.clone(),
-                    uo_id.clone(),
-                ))
-            }
-            None => None,
-            _ => return Err(UserCollectionError::InvalidEvent(e.unwrap().clone())),
-        };
-        for event in iter {
-            match event {
-                UserCollectionEvent::Aggregate(_, event) => {
-                    if let Some(aggregate) = aggregate.as_mut() {
-                        aggregate.apply_event(event);
-                    }
-                }
-                UserCollectionEvent::Deleted(_) => {
-                    return Ok(None);
-                }
-                _ => {}
-            }
-        }
-        Ok(aggregate)
-    }
-    fn handle_command<ES: EventStore<Self::Event>>(
-        &mut self,
-        id: Self::Id,
-        command: &<Self::Aggregate as Aggregate>::Command,
-        store: &mut ES,
-    ) -> Result<Self::Response, Self::Error> {
-        let aggregate = self
-            .find(id.clone(), store)?
-            .ok_or_else(|| UserCollectionError::NotFound(id.clone()))?;
-        let events = aggregate
-            .handle_command(command)?
-            .iter()
-            .map(|e| UserCollectionEvent::Aggregate(id.clone(), e.clone()))
-            .collect();
-        store
-            .save(events)
-            .map_err(|e| UserCollectionError::Store(format!("{:?}", e)))?;
-        Ok("Success".to_string())
-    }
-}
-
-pub struct OnMemoryEventBroker {}
-impl EventBroker<OrganizationCollectionEvent> for OnMemoryEventBroker {
-    type Error = ();
-    fn publish(&mut self, events: Vec<OrganizationCollectionEvent>) -> Result<(), Self::Error> {
-        for event in events {
-            println!("Organization Event: {:?} {:?}", event.aggregate_id(), event);
-        }
+        org.reserved_id = Some(user_add_id);
         Ok(())
     }
-}
-impl EventBroker<UserCollectionEvent> for OnMemoryEventBroker {
-    type Error = ();
-    fn publish(&mut self, events: Vec<UserCollectionEvent>) -> Result<(), Self::Error> {
-        for event in events {
-            println!("User Event: {:?} {:?}", event.aggregate_id(), event);
+    fn add_user(&mut self, id: OrgId, user_id: UserId) -> Result<(), String> {
+        let org = self.orgs.get_mut(&id).ok_or("Org not found")?;
+        if org.reserved_id.is_none() {
+            return Err("No user reserved".to_string());
         }
+        org.users.push(user_id.clone());
+        org.reserved_id = None;
         Ok(())
     }
 }
 
-pub struct OnMemoryEventStore {
-    org_events: HashMap<OrganizationId, Vec<OrganizationCollectionEvent>>,
-    org_uncommitted_events: HashMap<OrganizationId, Vec<OrganizationCollectionEvent>>,
-    user_events: HashMap<UserId, Vec<UserCollectionEvent>>,
-    user_uncommitted_events: HashMap<UserId, Vec<UserCollectionEvent>>,
-    broker: OnMemoryEventBroker,
-    in_transaction: bool,
+#[derive(Debug, Clone)]
+struct UserData(pub String);
+
+struct User {
+    id: UserId,
+    data: UserData,
+    org_id: OrgId,
+}
+
+struct UserService {
+    users: HashMap<UserId, User>,
+}
+impl UserService {
+    fn create_user(&mut self, data: UserData, org_id: OrgId) -> Result<UserId, String> {
+        let id = UserId(data.0.clone());
+        if self.users.contains_key(&id) {
+            return Err("User already exists".to_string());
+        }
+        self.users.insert(
+            id.clone(),
+            User {
+                id: id.clone(),
+                data,
+                org_id,
+            },
+        );
+        Ok(id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UserAddId(String);
+
+#[derive(Debug, Clone)]
+enum UserAddBacklogStatus {
+    Created(UserData, OrgId),
+    Reserved(OrgId),
+    UserCreated(UserId, UserData),
+    UserAdded(UserId, OrgId),
+}
+
+struct UserAddBacklog {
+    id: UserAddId,
+    status: UserAddBacklogStatus,
+}
+
+#[derive(Debug, Clone)]
+struct UserAddCreatedEvent {
+    id: UserAddId,
+    data: UserData,
+    org_id: OrgId,
+}
+
+#[derive(Debug, Clone)]
+enum UserAddEvent {
+    Reserved(UserAddId, OrgId),
+    UserCreated(UserAddId, UserId, UserData),
+    UserAdded(UserAddId, UserId, OrgId),
+}
+
+impl Backlog for UserAddBacklog {
+    type Id = UserAddId;
+    type Status = UserAddBacklogStatus;
+    type CreateEvent = UserAddCreatedEvent;
+    type ResolveEvent = UserAddEvent;
+
+    fn id(&self) -> Self::Id {
+        self.id.clone()
+    }
+
+    fn create(event: Self::CreateEvent) -> Self {
+        UserAddBacklog {
+            id: event.id,
+            status: UserAddBacklogStatus::Created(event.data, event.org_id),
+        }
+    }
+
+    fn resolve(&mut self, event: Self::ResolveEvent) -> &Self::Status {
+        match event {
+            UserAddEvent::Reserved(_, org_id) => {
+                self.status = UserAddBacklogStatus::Reserved(org_id);
+            }
+            UserAddEvent::UserCreated(_, user_id, data) => {
+                self.status = UserAddBacklogStatus::UserCreated(user_id, data);
+            }
+            UserAddEvent::UserAdded(_, user_id, org_id) => {
+                self.status = UserAddBacklogStatus::UserAdded(user_id, org_id);
+            }
+        }
+        &self.status
+    }
+
+    fn status(&self) -> &Self::Status {
+        &self.status
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PersistableEventId {
+    UserAdd(UserAddId),
+}
+
+#[derive(Debug, Clone)]
+enum PersistableEvent {
+    UserAddCreated(UserAddCreatedEvent),
+    UserAdd(UserAddEvent),
+}
+
+struct OnMemoryEventStore {
+    uncommitted_events: HashMap<PersistableEventId, Vec<PersistableEvent>>,
+    is_transaction_active: bool,
+    events: HashMap<PersistableEventId, Vec<PersistableEvent>>,
 }
 
 #[derive(Debug)]
-pub struct EventStoreError(pub String);
+struct OnMemoryEventStoreError;
+impl std::fmt::Display for OnMemoryEventStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OnMemoryEventStoreError")
+    }
+}
+impl std::error::Error for OnMemoryEventStoreError {}
+
+impl EventStore for OnMemoryEventStore {
+    type Persistable = PersistableEvent;
+    type Error = OnMemoryEventStoreError;
+
+    fn save(&mut self, events: &[Self::Persistable]) -> Result<(), Self::Error> {
+        for event in events {
+            match event {
+                PersistableEvent::UserAddCreated(event) => {
+                    let id = PersistableEventId::UserAdd(event.id.clone());
+                    let events = self.uncommitted_events.entry(id).or_default();
+                    events.push(PersistableEvent::UserAddCreated(event.clone()));
+                }
+                PersistableEvent::UserAdd(event) => {
+                    let id = match event {
+                        UserAddEvent::Reserved(id, _) => PersistableEventId::UserAdd(id.clone()),
+                        UserAddEvent::UserCreated(id, _, _) => {
+                            PersistableEventId::UserAdd(id.clone())
+                        }
+                        UserAddEvent::UserAdded(id, _, _) => {
+                            PersistableEventId::UserAdd(id.clone())
+                        }
+                    };
+                    let events = self.uncommitted_events.entry(id).or_default();
+                    events.push(PersistableEvent::UserAdd(event.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 impl TransactionManager for OnMemoryEventStore {
-    type Error = EventStoreError;
+    type Error = OnMemoryEventStoreError;
+
     fn begin(&mut self) -> Result<(), Self::Error> {
-        self.in_transaction = true;
+        self.is_transaction_active = true;
         Ok(())
     }
+
     fn commit(&mut self) -> Result<(), Self::Error> {
-        let org_event_to_publish = self.org_uncommitted_events.clone();
-        let user_event_to_publish = self.user_uncommitted_events.clone();
-
-        for (id, events) in self.org_uncommitted_events.drain() {
-            let org_events = self.org_events.entry(id).or_default();
-            org_events.extend(events);
+        if !self.is_transaction_active {
+            return Err(OnMemoryEventStoreError);
         }
-        for (id, events) in self.user_uncommitted_events.drain() {
-            let user_events = self.user_events.entry(id).or_default();
-            user_events.extend(events);
+        for (id, unc_events) in self.uncommitted_events.drain() {
+            let events = self.events.entry(id).or_default();
+            events.extend(unc_events);
         }
-
-        self.in_transaction = false;
-
-        // Publish events
-        // TODO: Order of events is not guaranteed.
-        for (_, events) in org_event_to_publish {
-            self.broker.publish(events).unwrap();
-        }
-        for (_, events) in user_event_to_publish {
-            self.broker.publish(events).unwrap();
-        }
-
+        self.is_transaction_active = false;
         Ok(())
     }
+
     fn rollback(&mut self) -> Result<(), Self::Error> {
-        self.in_transaction = false;
+        if !self.is_transaction_active {
+            return Err(OnMemoryEventStoreError);
+        }
+        self.is_transaction_active = false;
         Ok(())
     }
 }
 
-impl EventStore<OrganizationCollectionEvent> for OnMemoryEventStore {
-    type Error = EventStoreError;
-    fn save(&mut self, events: Vec<OrganizationCollectionEvent>) -> Result<(), Self::Error> {
-        if self.in_transaction {
-            for event in events {
-                self.org_uncommitted_events
-                    .entry(event.aggregate_id())
-                    .or_default()
-                    .push(event);
-            }
-        } else {
-            return Err(EventStoreError("Not in transaction".to_string()));
-        }
-        Ok(())
-    }
-    fn load(&self, id: OrganizationId) -> Result<Vec<OrganizationCollectionEvent>, Self::Error> {
-        Ok(self.org_events.get(&id).cloned().unwrap_or_default())
-    }
-}
-
-impl EventStore<UserCollectionEvent> for OnMemoryEventStore {
-    type Error = EventStoreError;
-    fn save(&mut self, events: Vec<UserCollectionEvent>) -> Result<(), Self::Error> {
-        if self.in_transaction {
-            for event in events {
-                self.user_uncommitted_events
-                    .entry(event.aggregate_id())
-                    .or_default()
-                    .push(event);
-            }
-        } else {
-            return Err(EventStoreError("Not in transaction".to_string()));
-        }
-        Ok(())
-    }
-    fn load(
-        &self,
-        id: <UserCollectionEvent as CollectionEvent>::AggregateId,
-    ) -> Result<Vec<UserCollectionEvent>, Self::Error> {
-        Ok(self.user_events.get(&id).cloned().unwrap_or_default())
-    }
-}
-
-pub fn user_add_usecase<ES>(
-    name: String,
-    email: String,
-    org_id: OrganizationId,
-    org_collection: &mut OrganizationCollection,
-    user_collection: &mut UserCollection,
-    event_store: &mut ES,
-) -> Result<(), String>
-where
-    ES: EventStore<OrganizationCollectionEvent>
-        + EventStore<UserCollectionEvent>
-        + TransactionManager<Error = EventStoreError>,
-{
-    event_store.begin().map_err(|e| format!("{:?}", e))?;
-
-    let uo_id = match org_collection.handle_command(
-        org_id.clone(),
-        &OrganizationCommand::UserReserve(name.clone()),
-        event_store,
-    ) {
-        Ok(_) => UserOrganizationId(format!("{}-{}", org_id.0, name)),
-        Err(e) => {
-            event_store.rollback().unwrap();
-            return Err(format!("{:?}", e));
-        }
+fn create_user<ES: EventStore<Persistable = PersistableEvent> + TransactionManager>(
+    userdata: UserData,
+    org_id: OrgId,
+    us: &mut UserService,
+    os: &mut OrgService,
+    es: &mut ES,
+) -> Result<String, String> {
+    let user_add_id = UserAddId(userdata.0.clone());
+    let event = UserAddCreatedEvent {
+        id: user_add_id.clone(),
+        data: userdata.clone(),
+        org_id: org_id.clone(),
     };
+    let _backlog = UserAddBacklog::create(event.clone());
+    es.begin().map_err(|e| e.to_string())?;
+    es.save(&[PersistableEvent::UserAddCreated(event.clone())])
+        .map_err(|e| e.to_string())?;
+    es.commit().map_err(|e| e.to_string())?;
 
-    let user_id =
-        match user_collection.create((name, email, org_id.clone(), uo_id.clone()), event_store) {
-            Ok(id) => id,
-            Err(e) => {
-                event_store.rollback().unwrap();
-                return Err(format!("{:?}", e));
-            }
-        };
-    match org_collection.handle_command(
+    os.reserve_user(org_id.clone(), user_add_id.clone())
+        .map_err(|e| e.to_string())?;
+    es.begin().map_err(|e| e.to_string())?;
+    es.save(&[PersistableEvent::UserAdd(UserAddEvent::Reserved(
+        user_add_id.clone(),
         org_id.clone(),
-        &OrganizationCommand::AddUser(user_id.clone(), uo_id.clone()),
-        event_store,
-    ) {
-        Ok(_) => {}
-        Err(e) => {
-            event_store.rollback().unwrap();
-            return Err(format!("{:?}", e));
-        }
-    }
-    event_store.commit().map_err(|e| format!("{:?}", e))?;
-    Ok(())
+    ))])
+    .map_err(|e| e.to_string())?;
+    es.commit().map_err(|e| e.to_string())?;
+
+    let user_id = us
+        .create_user(userdata.clone(), org_id.clone())
+        .map_err(|e| e.to_string())?;
+    es.begin().map_err(|e| e.to_string())?;
+    es.save(&[PersistableEvent::UserAdd(UserAddEvent::UserCreated(
+        user_add_id.clone(),
+        user_id.clone(),
+        userdata.clone(),
+    ))])
+    .map_err(|e| e.to_string())?;
+    es.commit().map_err(|e| e.to_string())?;
+
+    os.add_user(org_id.clone(), user_id.clone())
+        .map_err(|e| e.to_string())?;
+    es.begin().map_err(|e| e.to_string())?;
+    es.save(&[PersistableEvent::UserAdd(UserAddEvent::UserAdded(
+        user_add_id.clone(),
+        user_id.clone(),
+        org_id,
+    ))])
+    .map_err(|e| e.to_string())?;
+    es.commit().map_err(|e| e.to_string())?;
+    Ok(user_add_id.0)
 }
 
 fn main() {
-    let mut org_collection = OrganizationCollection {};
-    let mut user_collection = UserCollection { length: 0 };
-    let mut event_store = OnMemoryEventStore {
-        org_events: HashMap::new(),
-        org_uncommitted_events: HashMap::new(),
-        user_events: HashMap::new(),
-        user_uncommitted_events: HashMap::new(),
-        broker: OnMemoryEventBroker {},
-        in_transaction: false,
+    let mut us = UserService {
+        users: HashMap::new(),
     };
 
-    event_store.begin().unwrap();
-    let org_id = org_collection
-        .create(("Example Corp.".to_string(), 3), &mut event_store)
-        .unwrap();
-    event_store.commit().unwrap();
+    let org_id = OrgId("org-1".to_string());
+    let org = Org {
+        id: org_id.clone(),
+        name: "Org 1".to_string(),
+        users: vec![],
+        max_users: 3,
+        reserved_id: None,
+    };
+    let mut os = OrgService {
+        orgs: HashMap::new(),
+    };
+    os.orgs.insert(org_id.clone(), org);
 
-    user_add_usecase(
-        "Alice".to_string(),
-        "alice@example.com".to_string(),
-        org_id.clone(),
-        &mut org_collection,
-        &mut user_collection,
-        &mut event_store,
-    )
-    .unwrap();
+    let mut es = OnMemoryEventStore {
+        uncommitted_events: HashMap::new(),
+        is_transaction_active: false,
+        events: HashMap::new(),
+    };
 
-    user_add_usecase(
-        "Bob".to_string(),
-        "bob@example.com".to_string(),
-        org_id.clone(),
-        &mut org_collection,
-        &mut user_collection,
-        &mut event_store,
-    )
-    .unwrap();
+    let userdata = UserData("user-1".to_string());
+    let user_add_id = create_user(userdata, org_id.clone(), &mut us, &mut os, &mut es).unwrap();
+    println!("User Add ID: {}", user_add_id);
 
-    user_add_usecase(
-        "Charlie".to_string(),
-        "char@example.com".to_string(),
-        org_id.clone(),
-        &mut org_collection,
-        &mut user_collection,
-        &mut event_store,
-    )
-    .unwrap();
+    let userdata = UserData("user-2".to_string());
+    let user_add_id = create_user(userdata, org_id.clone(), &mut us, &mut os, &mut es).unwrap();
+    println!("User Add ID: {}", user_add_id);
 
-    let res = user_add_usecase(
-        "David".to_string(),
-        "david@exapmle.com".to_string(),
-        org_id.clone(),
-        &mut org_collection,
-        &mut user_collection,
-        &mut event_store,
-    );
+    let userdata = UserData("user-3".to_string());
+    let user_add_id = create_user(userdata, org_id.clone(), &mut us, &mut os, &mut es).unwrap();
+    println!("User Add ID: {}", user_add_id);
 
-    assert!(res.is_err());
-    assert_eq!(event_store.user_events.len(), 3);
+    let userdata = UserData("user-4".to_string());
+    let user_add_id = create_user(userdata, org_id.clone(), &mut us, &mut os, &mut es);
+    assert_eq!(user_add_id, Err("Max users reached".to_string()));
 }
